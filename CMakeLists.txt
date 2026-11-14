@@ -44,6 +44,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 option(TEST_SENSOR "Build the color and line sensor test" OFF)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE Core/Robot/color_sensor.c)
 
 if(TEST_SENSOR)
     target_sources(${CMAKE_PROJECT_NAME} PRIVATE

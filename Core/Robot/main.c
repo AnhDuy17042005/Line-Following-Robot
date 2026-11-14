@@ -26,8 +26,6 @@ static volatile uint32_t controlTicks;
 static uint32_t processedTicks;
 static uint32_t lastControlMs;
 static uint32_t lastLogMs;
-static uint16_t previousLeftLogCount;
-static uint16_t previousRightLogCount;
 static volatile RobotStatus robotStatus;
 static uint8_t ledTicks;
 
@@ -37,11 +35,17 @@ static void Robot_Print(const char *message)
                           (uint16_t)strlen(message), 20U);
 }
 
+static void Robot_PrintLogHeader(void)
+{
+  Robot_Print("      TCRT5000 ADC       |  Error |  SET RPM  | MEAS RPM  | STATUS\r\n");
+  Robot_Print("  T1   T2   T3   T4   T5 | 0.1 mm |    L    R |    L    R |\r\n");
+  Robot_Print("------------------------------------------------------------------------\r\n");
+}
+
 static void Robot_LogStatus(const char *state,
                             const uint16_t values[LINE_SENSOR_COUNT],
                             float errorMeters, float leftSetRpm,
-                            float rightSetRpm, float leftRpm, float rightRpm,
-                            float leftDutyPercent, float rightDutyPercent)
+                            float rightSetRpm, float leftRpm, float rightRpm)
 {
   uint32_t nowMs = HAL_GetTick();
   if (nowMs - lastLogMs < 500U)
@@ -50,33 +54,25 @@ static void Robot_LogStatus(const char *state,
   }
   lastLogMs = nowMs;
 
+  char message[120];
+  int length;
   if (values == NULL)
   {
-    Robot_Print(state);
-    Robot_Print("\r\n");
-    return;
+    length = snprintf(message, sizeof(message),
+                      "%24s | %6s | %9s | %9s | %-12s\r\n",
+                      "-", "-", "-", "-", state);
   }
-
-  uint16_t leftCount;
-  uint16_t rightCount;
-  Motor_ReadEncoderCounts(&leftCount, &rightCount);
-  int16_t leftCountDelta = (int16_t)(leftCount - previousLeftLogCount);
-  int16_t rightCountDelta = (int16_t)(rightCount - previousRightLogCount);
-  previousLeftLogCount = leftCount;
-  previousRightLogCount = rightCount;
-
-  char message[160];
-  int length = snprintf(message, sizeof(message),
-                        "%s A=%u,%u,%u,%u,%u e=%d s=%d/%d v=%d/%d p=%d/%d c=%d/%d\r\n",
-                        state,
-                        (unsigned)values[0], (unsigned)values[1],
-                        (unsigned)values[2], (unsigned)values[3],
-                        (unsigned)values[4],
-                        (int)(errorMeters * 10000.0f),
-                        (int)leftSetRpm, (int)rightSetRpm,
-                        (int)leftRpm, (int)rightRpm,
-                        (int)leftDutyPercent, (int)rightDutyPercent,
-                        (int)leftCountDelta, (int)rightCountDelta);
+  else
+  {
+    length = snprintf(message, sizeof(message),
+                      "%4u %4u %4u %4u %4u | %6d | %4d %4d | %4d %4d | %-12s\r\n",
+                      (unsigned)values[0], (unsigned)values[1],
+                      (unsigned)values[2], (unsigned)values[3],
+                      (unsigned)values[4],
+                      (int)(errorMeters * 10000.0f),
+                      (int)leftSetRpm, (int)rightSetRpm,
+                      (int)leftRpm, (int)rightRpm, state);
+  }
   if (length > 0 && length < (int)sizeof(message))
   {
     (void)HAL_UART_Transmit(&huart3, (uint8_t *)message,
@@ -100,13 +96,14 @@ bool Robot_Init(void)
     Robot_Print("MOTOR INIT FAIL\r\n");
     return false;
   }
-  Motor_ReadEncoderCounts(&previousLeftLogCount, &previousRightLogCount);
   if (!LineSensor_Init())
   {
     Motor_Stop();
     Robot_Print("ADC INIT FAIL\r\n");
     return false;
   }
+  Robot_Print("ROBOT READY ADC CAL\r\n");
+  Robot_PrintLogHeader();
   if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
   {
     Motor_Stop();
@@ -116,7 +113,6 @@ bool Robot_Init(void)
   lastControlMs = HAL_GetTick();
   lastLogMs = lastControlMs;
   robotStatus = ROBOT_STATUS_NO_LINE;
-  Robot_Print("ROBOT READY ADC CAL\r\n");
   return true;
 }
 
@@ -128,7 +124,7 @@ void Robot_Task(void)
     if (HAL_GetTick() - lastControlMs >= 100U)
     {
       Robot_LogStatus("NO TIM2 TICK", NULL, 0.0f, 0.0f, 0.0f,
-                      0.0f, 0.0f, 0.0f, 0.0f);
+                      0.0f, 0.0f);
     }
     return;
   }
@@ -153,7 +149,7 @@ void Robot_Task(void)
     SpeedPi_Reset();
     robotStatus = ROBOT_STATUS_ERROR;
     Robot_LogStatus("MISSED TICK", NULL, 0.0f, 0.0f, 0.0f,
-                    0.0f, 0.0f, 0.0f, 0.0f);
+                    0.0f, 0.0f);
     return;
   }
 
@@ -164,7 +160,7 @@ void Robot_Task(void)
     SpeedPi_Reset();
     robotStatus = ROBOT_STATUS_ERROR;
     Robot_LogStatus("ADC READ FAIL", NULL, 0.0f, 0.0f, 0.0f,
-                    0.0f, 0.0f, 0.0f, 0.0f);
+                    0.0f, 0.0f);
     return;
   }
 
@@ -175,7 +171,7 @@ void Robot_Task(void)
     SpeedPi_Reset();
     robotStatus = ROBOT_STATUS_NO_LINE;
     Robot_LogStatus("NO LINE", lineValues, 0.0f, 0.0f, 0.0f,
-                    leftMeasuredRpm, rightMeasuredRpm, 0.0f, 0.0f);
+                    leftMeasuredRpm, rightMeasuredRpm);
     return;
   }
 
@@ -218,7 +214,7 @@ void Robot_Task(void)
   robotStatus = ROBOT_STATUS_RUNNING;
   Robot_LogStatus("RUN", lineValues, errorMeters, leftSetRpm,
                   rightSetRpm, leftMeasuredRpm,
-                  rightMeasuredRpm, leftDutyPercent, rightDutyPercent);
+                  rightMeasuredRpm);
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *timer)

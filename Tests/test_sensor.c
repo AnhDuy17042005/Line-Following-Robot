@@ -1,28 +1,13 @@
 #include "main.h"
+#include "color_sensor.h"
 
 #include <stdio.h>
 #include <string.h>
 
-/* TCS34725/TCS34727: 7-bit I2C address 0x29. HAL expects it shifted left. */
-#define TCS_ADDR            (0x29U << 1)
-#define TCS_CMD             0x80U
-#define TCS_AUTO_INCREMENT  0x20U
-#define TCS_REG_ENABLE      0x00U
-#define TCS_REG_ATIME       0x01U
-#define TCS_REG_CONTROL     0x0FU
-#define TCS_REG_ID          0x12U
-#define TCS_REG_STATUS      0x13U
-#define TCS_REG_CDATA       0x14U
-
-#define TCS_PON             0x01U
-#define TCS_AEN             0x02U
-#define TCS_AVALID          0x01U
-#define I2C_TIMEOUT_MS      100U
 #define LINE_SENSOR_COUNT    5U
 #define LINE_TIMEOUT_MS      10U
 
 extern ADC_HandleTypeDef hadc1;
-extern I2C_HandleTypeDef hi2c1;
 extern UART_HandleTypeDef huart3;
 
 static uint8_t sensor_ready;
@@ -94,33 +79,13 @@ static uint8_t TestLine_Read(uint16_t values[LINE_SENSOR_COUNT])
   return 1U;
 }
 
-static HAL_StatusTypeDef Tcs_Write(uint8_t reg, uint8_t value)
+static const char *Color_Name(ColorSensorColor color)
 {
-  return HAL_I2C_Mem_Write(&hi2c1, TCS_ADDR, TCS_CMD | reg,
-                           I2C_MEMADD_SIZE_8BIT, &value, 1U, I2C_TIMEOUT_MS);
-}
-
-static HAL_StatusTypeDef Tcs_Read(uint8_t reg, uint8_t *value)
-{
-  return HAL_I2C_Mem_Read(&hi2c1, TCS_ADDR, TCS_CMD | reg,
-                          I2C_MEMADD_SIZE_8BIT, value, 1U, I2C_TIMEOUT_MS);
-}
-
-/* These thresholds are only starting points for red/blue cargo testing. */
-static const char *Color_Name(uint16_t red, uint16_t green,
-                              uint16_t blue, uint16_t clear)
-{
-  if (clear < 100U || clear > 40000U)
-  {
-    return "NONE";
-  }
-  if ((uint32_t)red * 100U > (uint32_t)green * 135U &&
-      (uint32_t)red * 100U > (uint32_t)blue * 135U)
+  if (color == COLOR_SENSOR_RED)
   {
     return "RED";
   }
-  if ((uint32_t)blue * 100U > (uint32_t)red * 140U &&
-      (uint32_t)blue * 100U > (uint32_t)green * 115U)
+  if (color == COLOR_SENSOR_BLUE)
   {
     return "BLUE";
   }
@@ -136,40 +101,39 @@ void TestColor_Init(void)
   HAL_GPIO_WritePin(STBY_GPIO_Port, STBY_Pin, GPIO_PIN_RESET);
   sensor_ready = 0U;
 
-  if (HAL_I2C_IsDeviceReady(&hi2c1, TCS_ADDR, 2U, I2C_TIMEOUT_MS) != HAL_OK)
+  ColorSensorStatus result = ColorSensor_Init(&id);
+  if (result == COLOR_SENSOR_NO_DEVICE)
   {
     Uart_Print("TCS3472: I2C device 0x29 not found\r\n");
     return;
   }
-  if (Tcs_Read(TCS_REG_ID, &id) != HAL_OK)
+  if (result == COLOR_SENSOR_ID_READ_ERROR)
   {
     Uart_Print("TCS3472: failed to read ID\r\n");
     return;
   }
-  if (id != 0x44U && id != 0x4DU)
+  if (result == COLOR_SENSOR_UNSUPPORTED_ID)
   {
     (void)snprintf(line, sizeof(line),
                    "TCS3472: ID=0x%02X, expected 0x44 or 0x4D\r\n", id);
     Uart_Print(line);
     return;
   }
-
-  /* 0xD5 = 42 * 2.4 ms (~101 ms); CONTROL=1 gives 4x gain. */
-  if (Tcs_Write(TCS_REG_ATIME, 0xD5U) != HAL_OK ||
-      Tcs_Write(TCS_REG_CONTROL, 0x01U) != HAL_OK ||
-      Tcs_Write(TCS_REG_ENABLE, TCS_PON) != HAL_OK)
+  if (result == COLOR_SENSOR_CONFIG_ERROR)
   {
     Uart_Print("TCS3472: configuration failed\r\n");
     return;
   }
-  HAL_Delay(3U); /* Oscillator start after PON. */
-  if (Tcs_Write(TCS_REG_ENABLE, TCS_PON | TCS_AEN) != HAL_OK)
+  if (result == COLOR_SENSOR_ENABLE_ERROR)
   {
     Uart_Print("TCS3472: failed to enable color measurement\r\n");
     return;
   }
-
-  HAL_Delay(110U); /* Wait for the first complete integration. */
+  if (result != COLOR_SENSOR_OK)
+  {
+    Uart_Print("TCS3472: initialization failed\r\n");
+    return;
+  }
   sensor_ready = 1U;
   if (header_printed == 0U)
   {
@@ -182,10 +146,8 @@ void TestColor_Init(void)
 
 void TestColor_Task(void)
 {
-  uint8_t status = 0U;
-  uint8_t raw[8];
   uint16_t line_adc[5];
-  uint16_t clear, red, green, blue;
+  ColorSensorSample sample;
   char line[112];
 
   /* Heartbeat: if the LED toggles, the application reached its main loop. */
@@ -198,34 +160,21 @@ void TestColor_Task(void)
     return;
   }
 
-  if (Tcs_Read(TCS_REG_STATUS, &status) != HAL_OK)
-  {
-    Uart_Print("TCS3472: failed to read STATUS\r\n");
-    sensor_ready = 0U;
-    return;
-  }
-  if ((status & TCS_AVALID) == 0U)
+  ColorSensorStatus result = ColorSensor_Read(&sample);
+  if (result == COLOR_SENSOR_NOT_READY)
   {
     Uart_Print("TCS3472: waiting for valid color data\r\n");
     HAL_Delay(100U);
     return;
   }
-
-  /* One auto-increment transfer reads C, R, G, B as little-endian words. */
-  if (HAL_I2C_Mem_Read(&hi2c1, TCS_ADDR,
-                       TCS_CMD | TCS_AUTO_INCREMENT | TCS_REG_CDATA,
-                       I2C_MEMADD_SIZE_8BIT, raw, sizeof(raw),
-                       I2C_TIMEOUT_MS) != HAL_OK)
+  if (result != COLOR_SENSOR_OK)
   {
-    Uart_Print("TCS3472: failed to read RGBC\r\n");
+    Uart_Print(result == COLOR_SENSOR_STATUS_READ_ERROR ?
+               "TCS3472: failed to read STATUS\r\n" :
+               "TCS3472: failed to read RGBC\r\n");
     sensor_ready = 0U;
     return;
   }
-
-  clear = (uint16_t)raw[0] | ((uint16_t)raw[1] << 8);
-  red   = (uint16_t)raw[2] | ((uint16_t)raw[3] << 8);
-  green = (uint16_t)raw[4] | ((uint16_t)raw[5] << 8);
-  blue  = (uint16_t)raw[6] | ((uint16_t)raw[7] << 8);
 
   if (TestLine_Read(line_adc) == 0U)
   {
@@ -238,8 +187,9 @@ void TestColor_Task(void)
                  (unsigned)line_adc[0], (unsigned)line_adc[1],
                  (unsigned)line_adc[2], (unsigned)line_adc[3],
                  (unsigned)line_adc[4],
-                 (unsigned)red, (unsigned)green, (unsigned)blue,
-                 (unsigned)clear, Color_Name(red, green, blue, clear));
+                 (unsigned)sample.red, (unsigned)sample.green,
+                 (unsigned)sample.blue, (unsigned)sample.clear,
+                 Color_Name(ColorSensor_Detect(&sample)));
   Uart_Print(line);
   HAL_Delay(300U);
 }
