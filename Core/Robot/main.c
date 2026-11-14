@@ -1,15 +1,29 @@
 #include "main.h"
 #include "robot.h"
 #include "robot_internal.h"
+#include "color_sensor.h"
 
 #include <stdio.h>
 #include <string.h>
 
 #define BASE_SPEED_MPS 0.25f
 #define WHEEL_SPACING_M 0.174f
-#define WHEEL_DIAMETER_M 0.080f
 #define MOTOR_MAX_RPM 333.0f
 #define PI_F 3.14159265f
+
+/* Measure these offsets on the assembled robot before relying on the stop.
+   A positive sensor-to-tray offset means the tray is behind the line probe. */
+#define LOAD_ZONE_CENTER_MM 2000.0f
+#define LOAD_SENSOR_TO_TRAY_MM 100.0f
+#define LOAD_BRAKE_LEAD_MM 0.0f
+#define LOAD_SLOWDOWN_MM 200.0f
+#define LOAD_APPROACH_SPEED_MPS 0.15f
+#define LOAD_MIN_SETTLE_MS 150U
+#define LOAD_STABLE_TICKS 10U
+#define ENCODER_STALL_MS 500U
+#define COLOR_SAMPLE_INTERVAL_MS 120U
+#define COLOR_CONFIRM_SAMPLES 10U
+#define STATUS_HEARTBEAT_MS 1000U
 
 extern TIM_HandleTypeDef htim2;
 extern UART_HandleTypeDef huart3;
@@ -19,15 +33,46 @@ typedef enum
   ROBOT_STATUS_INIT,
   ROBOT_STATUS_NO_LINE,
   ROBOT_STATUS_RUNNING,
+  ROBOT_STATUS_STOPPED,
   ROBOT_STATUS_ERROR
 } RobotStatus;
+
+typedef enum
+{
+  RUN_TO_LOAD,
+  STOP_LOAD,
+  READ_COLOR,
+  RUN_TO_FORK,
+  FORK,
+  RUN_TO_END,
+  STOP_END
+} RobotPhase;
+
+typedef struct
+{
+  RobotPhase phase;
+  ColorSensorColor cargoColor;
+  ColorSensorColor candidateColor;
+  uint8_t colorStreak;
+  uint8_t stoppedTicks;
+  uint32_t phaseStartedMs;
+  uint32_t lastColorSampleMs;
+  uint32_t lastEncoderMotionMs;
+  float lastDistanceMm;
+  float loadStopDistanceMm;
+  bool distanceStarted;
+  bool fault;
+} RobotProcess;
 
 static volatile uint32_t controlTicks;
 static uint32_t processedTicks;
 static uint32_t lastControlMs;
 static uint32_t lastLogMs;
+static uint32_t lastHeartbeatMs;
 static volatile RobotStatus robotStatus;
 static uint8_t ledTicks;
+static RobotProcess process;
+static char faultMessage[128];
 
 static void Robot_Print(const char *message)
 {
@@ -35,11 +80,81 @@ static void Robot_Print(const char *message)
                           (uint16_t)strlen(message), 20U);
 }
 
+static const char *Robot_PhaseName(RobotPhase phase)
+{
+  switch (phase)
+  {
+    case RUN_TO_LOAD: return "RUN_TO_LOAD";
+    case STOP_LOAD: return "STOP_LOAD";
+    case READ_COLOR: return "READ_COLOR";
+    case RUN_TO_FORK: return "RUN_TO_FORK";
+    case FORK: return "FORK";
+    case RUN_TO_END: return "RUN_TO_END";
+    case STOP_END: return "STOP_END";
+    default: return "UNKNOWN";
+  }
+}
+
+static void Robot_EnterPhase(RobotPhase phase)
+{
+  char message[48];
+  process.phase = phase;
+  process.phaseStartedMs = HAL_GetTick();
+  (void)snprintf(message, sizeof(message), "STATE %s\r\n",
+                 Robot_PhaseName(phase));
+  Robot_Print(message);
+}
+
+static void Robot_Fault(const char *message)
+{
+  Motor_Stop();
+  LinePd_Reset();
+  SpeedPi_Reset();
+  process.fault = true;
+  robotStatus = ROBOT_STATUS_ERROR;
+  (void)snprintf(faultMessage, sizeof(faultMessage), "%s", message);
+  Robot_Print(faultMessage);
+}
+
+static void Robot_LogHeartbeat(void)
+{
+  if (!process.fault && process.phase != STOP_LOAD &&
+      process.phase != READ_COLOR)
+  {
+    return;
+  }
+
+  uint32_t nowMs = HAL_GetTick();
+  if (nowMs - lastHeartbeatMs < STATUS_HEARTBEAT_MS)
+  {
+    return;
+  }
+  lastHeartbeatMs = nowMs;
+  if (process.fault)
+  {
+    Robot_Print(faultMessage);
+    return;
+  }
+
+  const char *cargoName = process.cargoColor == COLOR_SENSOR_RED ? "RED" :
+                          process.cargoColor == COLOR_SENSOR_BLUE ? "BLUE" :
+                          "NONE";
+  char message[96];
+  (void)snprintf(message, sizeof(message),
+                 "STATE %s D=%d mm CARGO=%s COLOR=%u/%u STOP=%u/%u\r\n",
+                 Robot_PhaseName(process.phase), (int)Motor_GetDistanceMm(),
+                 cargoName, (unsigned)process.colorStreak,
+                 (unsigned)COLOR_CONFIRM_SAMPLES,
+                 (unsigned)process.stoppedTicks,
+                 (unsigned)LOAD_STABLE_TICKS);
+  Robot_Print(message);
+}
+
 static void Robot_PrintLogHeader(void)
 {
-  Robot_Print("      TCRT5000 ADC       |  Error |  SET RPM  | MEAS RPM  | STATUS\r\n");
-  Robot_Print("  T1   T2   T3   T4   T5 | 0.1 mm |    L    R |    L    R |\r\n");
-  Robot_Print("------------------------------------------------------------------------\r\n");
+  Robot_Print("      TCRT5000 ADC       |  Error |  SET RPM  | MEAS RPM  | DIST mm | STATUS\r\n");
+  Robot_Print("  T1   T2   T3   T4   T5 | 0.1 mm |    L    R |    L    R |         |\r\n");
+  Robot_Print("----------------------------------------------------------------------------------\r\n");
 }
 
 static void Robot_LogStatus(const char *state,
@@ -56,22 +171,23 @@ static void Robot_LogStatus(const char *state,
 
   char message[120];
   int length;
+  int distanceMm = process.distanceStarted ? (int)Motor_GetDistanceMm() : 0;
   if (values == NULL)
   {
     length = snprintf(message, sizeof(message),
-                      "%24s | %6s | %9s | %9s | %-12s\r\n",
-                      "-", "-", "-", "-", state);
+                      "%24s | %6s | %9s | %9s | %7d | %-12s\r\n",
+                      "-", "-", "-", "-", distanceMm, state);
   }
   else
   {
     length = snprintf(message, sizeof(message),
-                      "%4u %4u %4u %4u %4u | %6d | %4d %4d | %4d %4d | %-12s\r\n",
+                      "%4u %4u %4u %4u %4u | %6d | %4d %4d | %4d %4d | %7d | %-12s\r\n",
                       (unsigned)values[0], (unsigned)values[1],
                       (unsigned)values[2], (unsigned)values[3],
                       (unsigned)values[4],
                       (int)(errorMeters * 10000.0f),
                       (int)leftSetRpm, (int)rightSetRpm,
-                      (int)leftRpm, (int)rightRpm, state);
+                      (int)leftRpm, (int)rightRpm, distanceMm, state);
   }
   if (length > 0 && length < (int)sizeof(message))
   {
@@ -80,8 +196,119 @@ static void Robot_LogStatus(const char *state,
   }
 }
 
+static void Robot_ReadColorTask(void)
+{
+  uint32_t nowMs = HAL_GetTick();
+  if (nowMs - process.lastColorSampleMs < COLOR_SAMPLE_INTERVAL_MS)
+  {
+    return;
+  }
+  process.lastColorSampleMs = nowMs;
+
+  ColorSensorSample sample;
+  ColorSensorStatus result = ColorSensor_Read(&sample);
+  if (result == COLOR_SENSOR_NOT_READY)
+  {
+    return; /* No new conversion yet; do not count the same sample twice. */
+  }
+  if (result != COLOR_SENSOR_OK)
+  {
+    process.candidateColor = COLOR_SENSOR_NONE;
+    process.colorStreak = 0U;
+    Robot_Print("COLOR READ ERROR; streak reset\r\n");
+    return;
+  }
+
+  ColorSensorColor color = ColorSensor_Detect(&sample);
+  if (color == COLOR_SENSOR_NONE)
+  {
+    process.candidateColor = COLOR_SENSOR_NONE;
+    process.colorStreak = 0U;
+  }
+  else if (color == process.candidateColor)
+  {
+    ++process.colorStreak;
+  }
+  else
+  {
+    process.candidateColor = color;
+    process.colorStreak = 1U;
+  }
+
+  char message[96];
+  const char *colorName = color == COLOR_SENSOR_RED ? "RED" :
+                          color == COLOR_SENSOR_BLUE ? "BLUE" : "NONE";
+  (void)snprintf(message, sizeof(message),
+                 "COLOR R=%u G=%u B=%u C=%u %s %u/%u\r\n",
+                 (unsigned)sample.red, (unsigned)sample.green,
+                 (unsigned)sample.blue, (unsigned)sample.clear,
+                 colorName, (unsigned)process.colorStreak,
+                 (unsigned)COLOR_CONFIRM_SAMPLES);
+  Robot_Print(message);
+
+  if (process.colorStreak >= COLOR_CONFIRM_SAMPLES)
+  {
+    process.cargoColor = color;
+    Robot_Print(color == COLOR_SENSOR_RED ? "CARGO RED\r\n" :
+                "CARGO BLUE\r\n");
+    /* Restart the movement watchdog after the deliberate stop for color. */
+    LinePd_Reset();
+    SpeedPi_Reset();
+    process.lastDistanceMm = Motor_GetDistanceMm();
+    process.lastEncoderMotionMs = HAL_GetTick();
+    Robot_EnterPhase(RUN_TO_FORK);
+    processedTicks = controlTicks;
+    lastControlMs = HAL_GetTick();
+    Robot_Print("RESUME LINE FOLLOWING; CARGO SAVED\r\n");
+  }
+}
+
+static void Robot_StopLoadTask(float leftRpm, float rightRpm)
+{
+  Motor_Stop();
+  if (leftRpm > -4.6f && leftRpm < 4.6f &&
+      rightRpm > -4.6f && rightRpm < 4.6f)
+  {
+    if (process.stoppedTicks < LOAD_STABLE_TICKS)
+    {
+      ++process.stoppedTicks;
+    }
+  }
+  else
+  {
+    process.stoppedTicks = 0U;
+  }
+
+  if (process.stoppedTicks < LOAD_STABLE_TICKS ||
+      HAL_GetTick() - process.phaseStartedMs < LOAD_MIN_SETTLE_MS)
+  {
+    return;
+  }
+
+  char message[64];
+  (void)snprintf(message, sizeof(message), "LOAD STOP AT %d mm\r\n",
+                 (int)Motor_GetDistanceMm());
+  Robot_Print(message);
+
+  ColorSensorStatus result = ColorSensor_Init(NULL);
+  if (result != COLOR_SENSOR_OK)
+  {
+    (void)snprintf(message, sizeof(message),
+                   "COLOR INIT FAIL status=%d\r\n", (int)result);
+    Robot_Fault(message);
+    return;
+  }
+  process.lastColorSampleMs = HAL_GetTick() - COLOR_SAMPLE_INTERVAL_MS;
+  Robot_EnterPhase(READ_COLOR);
+}
+
 bool Robot_Init(void)
 {
+  memset(&process, 0, sizeof(process));
+  process.cargoColor = COLOR_SENSOR_NONE;
+  process.candidateColor = COLOR_SENSOR_NONE;
+  process.loadStopDistanceMm = LOAD_ZONE_CENTER_MM +
+                               LOAD_SENSOR_TO_TRAY_MM - LOAD_BRAKE_LEAD_MM;
   controlTicks = 0U;
   processedTicks = 0U;
   robotStatus = ROBOT_STATUS_INIT;
@@ -104,6 +331,7 @@ bool Robot_Init(void)
   }
   Robot_Print("ROBOT READY ADC CAL\r\n");
   Robot_PrintLogHeader();
+  Robot_EnterPhase(RUN_TO_LOAD);
   if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
   {
     Motor_Stop();
@@ -112,19 +340,36 @@ bool Robot_Init(void)
   }
   lastControlMs = HAL_GetTick();
   lastLogMs = lastControlMs;
+  lastHeartbeatMs = lastControlMs;
+  process.lastEncoderMotionMs = lastControlMs;
   robotStatus = ROBOT_STATUS_NO_LINE;
   return true;
 }
 
 void Robot_Task(void)
 {
+  Robot_LogHeartbeat();
+  if (process.fault)
+  {
+    return;
+  }
+  if (process.phase == READ_COLOR)
+  {
+    Robot_ReadColorTask();
+    return;
+  }
+  if (process.phase != RUN_TO_LOAD && process.phase != STOP_LOAD &&
+      process.phase != RUN_TO_FORK)
+  {
+    return; /* Fork/end actions are reserved for later stages. */
+  }
+
   uint32_t currentTicks = controlTicks;
   if (currentTicks == processedTicks)
   {
     if (HAL_GetTick() - lastControlMs >= 100U)
     {
-      Robot_LogStatus("NO TIM2 TICK", NULL, 0.0f, 0.0f, 0.0f,
-                      0.0f, 0.0f);
+      Robot_Fault("NO TIM2 TICK; MOTORS STOPPED\r\n");
     }
     return;
   }
@@ -153,11 +398,31 @@ void Robot_Task(void)
     return;
   }
 
+  if (process.phase == STOP_LOAD)
+  {
+    Robot_StopLoadTask(leftMeasuredRpm, rightMeasuredRpm);
+    return;
+  }
+
+  float distanceMm = Motor_GetDistanceMm();
+  if (process.phase == RUN_TO_LOAD && process.distanceStarted &&
+      distanceMm >= process.loadStopDistanceMm)
+  {
+    Motor_Stop();
+    LinePd_Reset();
+    SpeedPi_Reset();
+    process.stoppedTicks = 0U;
+    robotStatus = ROBOT_STATUS_STOPPED;
+    Robot_EnterPhase(STOP_LOAD);
+    return;
+  }
+
   if (!LineSensor_Read(lineValues))
   {
     Motor_Stop();
     LinePd_Reset();
     SpeedPi_Reset();
+    process.lastEncoderMotionMs = HAL_GetTick();
     robotStatus = ROBOT_STATUS_ERROR;
     Robot_LogStatus("ADC READ FAIL", NULL, 0.0f, 0.0f, 0.0f,
                     0.0f, 0.0f);
@@ -169,15 +434,59 @@ void Robot_Task(void)
     Motor_Stop();
     LinePd_Reset();
     SpeedPi_Reset();
+    process.lastEncoderMotionMs = HAL_GetTick();
     robotStatus = ROBOT_STATUS_NO_LINE;
     Robot_LogStatus("NO LINE", lineValues, 0.0f, 0.0f, 0.0f,
                     leftMeasuredRpm, rightMeasuredRpm);
     return;
   }
 
+  if (!process.distanceStarted)
+  {
+    /* The first valid line marks the start of motion and the 2000 mm route. */
+    Motor_ResetDistance();
+    process.distanceStarted = true;
+    process.lastDistanceMm = 0.0f;
+    process.lastEncoderMotionMs = HAL_GetTick();
+    distanceMm = 0.0f;
+    Robot_Print("DISTANCE START 0 mm\r\n");
+  }
+
+  if (distanceMm > process.lastDistanceMm + 0.05f)
+  {
+    process.lastEncoderMotionMs = HAL_GetTick();
+  }
+  process.lastDistanceMm = distanceMm;
+  if (HAL_GetTick() - process.lastEncoderMotionMs >= ENCODER_STALL_MS)
+  {
+    int32_t leftCounts;
+    int32_t rightCounts;
+    uint32_t leftPwmPercent;
+    uint32_t rightPwmPercent;
+    bool standbyEnabled;
+    char message[128];
+    Motor_GetTravelCounts(&leftCounts, &rightCounts);
+    Motor_GetDriveState(&leftPwmPercent, &rightPwmPercent, &standbyEnabled);
+    (void)snprintf(message, sizeof(message),
+                   "ENCODER STALL D=%d L=%ld R=%ld PWM=%lu/%lu STBY=%u A=%u,%u,%u,%u,%u\r\n",
+                   (int)distanceMm, (long)leftCounts, (long)rightCounts,
+                   (unsigned long)leftPwmPercent,
+                   (unsigned long)rightPwmPercent,
+                   standbyEnabled ? 1U : 0U,
+                   (unsigned)lineValues[0], (unsigned)lineValues[1],
+                   (unsigned)lineValues[2], (unsigned)lineValues[3],
+                   (unsigned)lineValues[4]);
+    Robot_Fault(message);
+    return;
+  }
+
   float yawRate = LinePd_Update(errorMeters, periodSeconds);
-  float leftSpeed = BASE_SPEED_MPS - 0.5f * WHEEL_SPACING_M * yawRate;
-  float rightSpeed = BASE_SPEED_MPS + 0.5f * WHEEL_SPACING_M * yawRate;
+  float baseSpeed = process.phase == RUN_TO_LOAD &&
+                    distanceMm >= process.loadStopDistanceMm -
+                    LOAD_SLOWDOWN_MM ? LOAD_APPROACH_SPEED_MPS :
+                    BASE_SPEED_MPS;
+  float leftSpeed = baseSpeed - 0.5f * WHEEL_SPACING_M * yawRate;
+  float rightSpeed = baseSpeed + 0.5f * WHEEL_SPACING_M * yawRate;
   if (leftSpeed < 0.0f)
   {
     leftSpeed = 0.0f;
@@ -186,13 +495,13 @@ void Robot_Task(void)
   {
     rightSpeed = 0.0f;
   }
-  if (leftSpeed > BASE_SPEED_MPS)
+  if (leftSpeed > baseSpeed)
   {
-    leftSpeed = BASE_SPEED_MPS;
+    leftSpeed = baseSpeed;
   }
-  if (rightSpeed > BASE_SPEED_MPS)
+  if (rightSpeed > baseSpeed)
   {
-    rightSpeed = BASE_SPEED_MPS;
+    rightSpeed = baseSpeed;
   }
 
   float rpmPerMeterPerSecond = 60.0f / (PI_F * WHEEL_DIAMETER_M);
@@ -212,7 +521,8 @@ void Robot_Task(void)
                  &leftDutyPercent, &rightDutyPercent);
   Motor_SetDuty(leftDutyPercent, rightDutyPercent);
   robotStatus = ROBOT_STATUS_RUNNING;
-  Robot_LogStatus("RUN", lineValues, errorMeters, leftSetRpm,
+  Robot_LogStatus(process.phase == RUN_TO_FORK ? "TO_FORK" : "TO_LOAD",
+                  lineValues, errorMeters, leftSetRpm,
                   rightSetRpm, leftMeasuredRpm,
                   rightMeasuredRpm);
 }
@@ -222,16 +532,18 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *timer)
   if (timer == &htim2)
   {
     ++controlTicks;
-    /* Fast blink: no line; slow blink: running; LED off: control fault. */
+    /* Fast: no line; medium: stopped; slow: running; off: control fault. */
     if (robotStatus == ROBOT_STATUS_ERROR)
     {
       HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
       ledTicks = 0U;
     }
     else if (robotStatus == ROBOT_STATUS_NO_LINE ||
-             robotStatus == ROBOT_STATUS_RUNNING)
+             robotStatus == ROBOT_STATUS_RUNNING ||
+             robotStatus == ROBOT_STATUS_STOPPED)
     {
-      uint8_t halfPeriodTicks = robotStatus == ROBOT_STATUS_NO_LINE ? 10U : 50U;
+      uint8_t halfPeriodTicks = robotStatus == ROBOT_STATUS_NO_LINE ? 10U :
+                                robotStatus == ROBOT_STATUS_STOPPED ? 25U : 50U;
       if (++ledTicks >= halfPeriodTicks)
       {
         ledTicks = 0U;

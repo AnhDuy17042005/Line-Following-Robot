@@ -33,8 +33,8 @@ typedef enum
   COLOR_SENSOR_INVALID_ARGUMENT
 } ColorSensorStatus;
 
-/* Call before starting the robot's 10 ms control timer: initialization waits
-   for the first color integration to finish. deviceId may be NULL. */
+/* Call while the motors are stopped: initialization waits for the first color
+   integration to finish. deviceId may be NULL. */
 ColorSensorStatus ColorSensor_Init(uint8_t *deviceId);
 /* Blocking I2C read with a 100 ms timeout per transfer. Schedule outside
    the robot's 10 ms control step until an asynchronous read is implemented. */

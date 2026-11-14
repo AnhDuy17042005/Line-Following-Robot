@@ -15,6 +15,8 @@ extern TIM_HandleTypeDef htim4;
 
 static uint16_t previousLeftCount;
 static uint16_t previousRightCount;
+static int32_t leftTravelCounts;
+static int32_t rightTravelCounts;
 
 bool Motor_Init(void)
 {
@@ -28,8 +30,7 @@ bool Motor_Init(void)
     return false;
   }
 
-  previousLeftCount = (uint16_t)__HAL_TIM_GET_COUNTER(&htim1);
-  previousRightCount = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+  Motor_ResetDistance();
   return true;
 }
 
@@ -48,6 +49,37 @@ void Motor_ReadEncoderCounts(uint16_t *leftCount, uint16_t *rightCount)
   *rightCount = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
 }
 
+void Motor_ResetDistance(void)
+{
+  Motor_ReadEncoderCounts(&previousLeftCount, &previousRightCount);
+  leftTravelCounts = 0;
+  rightTravelCounts = 0;
+}
+
+float Motor_GetDistanceMm(void)
+{
+  const float mmPerCount = 3.14159265f * WHEEL_DIAMETER_M * 1000.0f /
+                           ENCODER_COUNTS_PER_REVOLUTION;
+  return 0.5f * (float)(leftTravelCounts + rightTravelCounts) * mmPerCount;
+}
+
+void Motor_GetTravelCounts(int32_t *leftCounts, int32_t *rightCounts)
+{
+  *leftCounts = leftTravelCounts;
+  *rightCounts = rightTravelCounts;
+}
+
+void Motor_GetDriveState(uint32_t *leftPwmPercent,
+                         uint32_t *rightPwmPercent, bool *standbyEnabled)
+{
+  uint32_t period = __HAL_TIM_GET_AUTORELOAD(&htim4) + 1U;
+  *leftPwmPercent = 100U * __HAL_TIM_GET_COMPARE(&htim4, TIM_CHANNEL_4) /
+                    period;
+  *rightPwmPercent = 100U * __HAL_TIM_GET_COMPARE(&htim4, TIM_CHANNEL_3) /
+                     period;
+  *standbyEnabled = HAL_GPIO_ReadPin(STBY_GPIO_Port, STBY_Pin) == GPIO_PIN_SET;
+}
+
 void Motor_ReadSpeed(float periodSeconds, float *leftRpm, float *rightRpm)
 {
   uint16_t leftCount;
@@ -59,6 +91,8 @@ void Motor_ReadSpeed(float periodSeconds, float *leftRpm, float *rightRpm)
 
   previousLeftCount = leftCount;
   previousRightCount = rightCount;
+  leftTravelCounts += (int32_t)((float)leftDelta * LEFT_ENCODER_FORWARD_SIGN);
+  rightTravelCounts += (int32_t)((float)rightDelta * RIGHT_ENCODER_FORWARD_SIGN);
   *leftRpm = (float)leftDelta * rpmPerCount * LEFT_ENCODER_FORWARD_SIGN;
   *rightRpm = (float)rightDelta * rpmPerCount * RIGHT_ENCODER_FORWARD_SIGN;
 }
