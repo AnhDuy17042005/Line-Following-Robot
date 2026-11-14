@@ -14,8 +14,7 @@ Mỗi preset có thư mục build riêng; mã trong `Core/Robot/` không cần s
 | Preset | Firmware |
 | --- | --- |
 | `robot` | Chương trình robot |
-| `test-color` | Test cảm biến màu và 5 mắt dò vạch |
-| `test-line` | Chỉ test 5 mắt dò vạch, in `LINE A=...` qua UART |
+| `test-sensor` | Test color và line sensor |
 
 Nếu terminal chưa tìm thấy Ninja hoặc `arm-none-eabi-*`, thêm bộ công cụ STM32 vào PATH:
 
