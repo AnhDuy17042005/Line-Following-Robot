@@ -20,6 +20,17 @@
 #define TCS_AVALID          0x01U
 #define I2C_TIMEOUT_MS      100U
 
+#define CLEAR_MIN          300U
+#define CLEAR_MAX        40000U
+
+#define RED_R_MIN           38
+#define RED_R_MINUS_B       8
+#define RED_R_MINUS_G       6
+
+#define BLU_B_MIN           38
+#define BLU_B_MINUS_R       8
+#define BLU_B_MINUS_G       3
+
 extern I2C_HandleTypeDef hi2c1;
 
 static bool initialized;
@@ -118,20 +129,27 @@ ColorSensorStatus ColorSensor_Read(ColorSensorSample *sample)
   return COLOR_SENSOR_OK;
 }
 
-/* Starting thresholds for red/blue cargo testing; tune on the robot. */
 ColorSensorColor ColorSensor_Detect(const ColorSensorSample *sample)
 {
-  if (sample == NULL || sample->clear < 100U || sample->clear > 40000U)
+  if (sample == NULL || sample->clear < CLEAR_MIN || sample->clear > CLEAR_MAX)
   {
     return COLOR_SENSOR_NONE;
   }
-  if ((uint32_t)sample->red * 100U > (uint32_t)sample->green * 135U &&
-      (uint32_t)sample->red * 100U > (uint32_t)sample->blue * 135U)
+
+  int32_t clear    = (int32_t)sample->clear;
+  int32_t redPct   = ((int32_t)sample->red * 100 + clear / 2) / clear;
+  int32_t greenPct = ((int32_t)sample->green * 100 + clear / 2) / clear;
+  int32_t bluePct  = ((int32_t)sample->blue * 100 + clear / 2) / clear;
+
+  if (redPct >= RED_R_MIN &&
+      redPct - bluePct >= RED_R_MINUS_B &&
+      redPct - greenPct >= RED_R_MINUS_G)
   {
     return COLOR_SENSOR_RED;
   }
-  if ((uint32_t)sample->blue * 100U > (uint32_t)sample->red * 140U &&
-      (uint32_t)sample->blue * 100U > (uint32_t)sample->green * 115U)
+  if (bluePct >= BLU_B_MIN &&
+      bluePct - redPct >= BLU_B_MINUS_R &&
+      bluePct - greenPct >= BLU_B_MINUS_G)
   {
     return COLOR_SENSOR_BLUE;
   }
