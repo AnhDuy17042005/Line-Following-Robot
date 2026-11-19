@@ -56,7 +56,8 @@ ENTRY(Reset_Handler)
 MEMORY
 {
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 20K
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 64K
+/* Keep the last two 1 KB pages for atomic line calibration records. */
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 62K
 }
 
 /* Highest address of the user mode stack */

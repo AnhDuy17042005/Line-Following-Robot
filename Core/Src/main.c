@@ -27,6 +27,7 @@ void TestColor_Task(void);
 void TestLine_Init(void);
 #else
 #include "robot.h"
+#include "calibration.h"
 #endif
 /* USER CODE END Includes */
 
@@ -90,7 +91,9 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+#ifndef TEST_SENSOR
+  Calibration_CaptureBootReason();
+#endif
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/

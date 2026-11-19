@@ -53,6 +53,7 @@ if(TEST_SENSOR)
     target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE TEST_SENSOR)
 else()
     target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+        Core/Robot/calibration.c
         Core/Robot/main.c
         Core/Robot/line_sensor.c
         Core/Robot/line_error.c
@@ -82,8 +83,12 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     # Add user defined libraries
 )
 
+get_filename_component(ARM_TOOLCHAIN_BIN_DIR "${CMAKE_C_COMPILER}" DIRECTORY)
+find_program(ARM_OBJCOPY NAMES arm-none-eabi-objcopy
+    HINTS "${ARM_TOOLCHAIN_BIN_DIR}" REQUIRED)
+
 add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_OBJCOPY} -O binary
+    COMMAND ${ARM_OBJCOPY} -O binary
             $<TARGET_FILE:${CMAKE_PROJECT_NAME}>
             ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_PROJECT_NAME}.bin
     COMMENT "Generating flashable binary"

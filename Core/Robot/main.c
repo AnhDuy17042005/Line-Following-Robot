@@ -2,6 +2,7 @@
 #include "robot.h"
 #include "robot_internal.h"
 #include "color_sensor.h"
+#include "calibration.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -17,7 +18,8 @@
 #define LOAD_SENSOR_TO_TRAY_MM 100.0f
 #define LOAD_BRAKE_LEAD_MM 0.0f
 #define LOAD_SLOWDOWN_MM 200.0f
-#define LOAD_APPROACH_SPEED_MPS 0.15f
+#define LOAD_APPROACH_SPEED_MPS 0.10f
+#define LINE_LOST_CONFIRM_TICKS 3U
 #define LOAD_MIN_SETTLE_MS 150U
 #define LOAD_STABLE_TICKS 10U
 #define ENCODER_STALL_MS 500U
@@ -73,6 +75,9 @@ static volatile RobotStatus robotStatus;
 static uint8_t ledTicks;
 static RobotProcess process;
 static char faultMessage[128];
+static bool calibrationMode;
+static bool calibrationReported;
+static uint8_t lineLostTicks;
 
 static void Robot_Print(const char *message)
 {
@@ -329,7 +334,21 @@ bool Robot_Init(void)
     Robot_Print("ADC INIT FAIL\r\n");
     return false;
   }
-  Robot_Print("ROBOT READY ADC CAL\r\n");
+  {
+    char message[40];
+    (void)snprintf(message, sizeof(message), "BOOT RCC_CSR=%08lX\r\n",
+                   (unsigned long)Calibration_GetBootResetFlags());
+    Robot_Print(message);
+  }
+  calibrationMode = !Calibration_Init();
+  calibrationReported = false;
+  if (calibrationMode)
+  {
+    Motor_Stop();
+    Robot_Print("LINE CAL: MOVE ALL 5 SENSORS OVER WHITE AND BLACK FOR 20 S\r\n");
+    return true;
+  }
+  Robot_Print("LINE CAL: LOADED FROM FLASH; ROBOT READY\r\n");
   Robot_PrintLogHeader();
   Robot_EnterPhase(RUN_TO_LOAD);
   if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
@@ -348,6 +367,18 @@ bool Robot_Init(void)
 
 void Robot_Task(void)
 {
+  if (calibrationMode)
+  {
+    CalibrationStatus result = Calibration_Task();
+    if (result != CALIBRATION_IN_PROGRESS && !calibrationReported)
+    {
+      calibrationReported = true;
+      Robot_Print(result == CALIBRATION_SAVED ?
+                  "LINE CAL SAVED; POWER OFF CONTROL, PLACE AT START, POWER ON\r\n" :
+                  "LINE CAL FAILED; CHECK ALL 5 SENSORS, THEN PRESS RESET\r\n");
+    }
+    return;
+  }
   Robot_LogHeartbeat();
   if (process.fault)
   {
@@ -431,6 +462,14 @@ void Robot_Task(void)
 
   if (!LineError_Calculate(lineValues, &errorMeters))
   {
+    if (process.distanceStarted &&
+        lineLostTicks < LINE_LOST_CONFIRM_TICKS)
+    {
+      ++lineLostTicks;
+      /* Keep the previous PWM for a brief dropout, then stop if it persists. */
+      LinePd_Reset();
+      return;
+    }
     Motor_Stop();
     LinePd_Reset();
     SpeedPi_Reset();
@@ -440,6 +479,7 @@ void Robot_Task(void)
                     leftMeasuredRpm, rightMeasuredRpm);
     return;
   }
+  lineLostTicks = 0U;
 
   if (!process.distanceStarted)
   {
@@ -495,15 +535,6 @@ void Robot_Task(void)
   {
     rightSpeed = 0.0f;
   }
-  if (leftSpeed > baseSpeed)
-  {
-    leftSpeed = baseSpeed;
-  }
-  if (rightSpeed > baseSpeed)
-  {
-    rightSpeed = baseSpeed;
-  }
-
   float rpmPerMeterPerSecond = 60.0f / (PI_F * WHEEL_DIAMETER_M);
   float leftSetRpm = leftSpeed * rpmPerMeterPerSecond;
   float rightSetRpm = rightSpeed * rpmPerMeterPerSecond;

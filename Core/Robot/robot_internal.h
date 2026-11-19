@@ -13,6 +13,8 @@ bool LineSensor_Read(uint16_t values[LINE_SENSOR_COUNT]);
 
 bool LineError_Calculate(const uint16_t values[LINE_SENSOR_COUNT],
                          float *errorMeters);
+bool LineError_SetCalibration(const uint16_t white[LINE_SENSOR_COUNT],
+                              const uint16_t black[LINE_SENSOR_COUNT]);
 
 void LinePd_Reset(void);
 float LinePd_Update(float errorMeters, float periodSeconds);

@@ -1,28 +1,59 @@
 #include "robot_internal.h"
 
-/* Initial lost-line threshold; tune it against measured white noise. */
-#define MIN_LINE_SIGNAL 0.5f
+#include <stddef.h>
 
-/* White and black ADC values measured on this robot. */
-static const uint16_t adcWhite[LINE_SENSOR_COUNT] = {
-  93U, 91U, 45U, 98U, 71U
-};
-static const uint16_t adcBlack[LINE_SENSOR_COUNT] = {
-  140U, 157U, 159U, 180U, 140U
-};
+/* A wide calibration span can make a clear partial line read below 0.5. */
+#define MIN_LINE_SIGNAL 0.5f
+#define MIN_PARTIAL_LINE_SIGNAL 0.10f
+#define MIN_PARTIAL_LINE_ADC 100
+
+static uint16_t adcWhite[LINE_SENSOR_COUNT];
+static uint16_t adcBlack[LINE_SENSOR_COUNT];
+static bool calibrationReady;
+/* On this robot T1 is on the right and T5 is on the left. */
 static const float sensorPositionMm[LINE_SENSOR_COUNT] = {
-  50.0f, 30.0f, 0.0f, -30.0f, -50.0f
+  -30.0f, -15.0f, 0.0f, 15.0f, 30.0f
 };
+
+bool LineError_SetCalibration(const uint16_t white[LINE_SENSOR_COUNT],
+                              const uint16_t black[LINE_SENSOR_COUNT])
+{
+  if (white == NULL || black == NULL)
+  {
+    return false;
+  }
+  for (uint32_t index = 0; index < LINE_SENSOR_COUNT; ++index)
+  {
+    if (white[index] > 4095U || black[index] > 4095U ||
+        black[index] < white[index] + 20U)
+    {
+      return false;
+    }
+  }
+  for (uint32_t index = 0; index < LINE_SENSOR_COUNT; ++index)
+  {
+    adcWhite[index] = white[index];
+    adcBlack[index] = black[index];
+  }
+  calibrationReady = true;
+  return true;
+}
 
 bool LineError_Calculate(const uint16_t values[LINE_SENSOR_COUNT],
                          float *errorMeters)
 {
+  if (!calibrationReady || values == NULL || errorMeters == NULL)
+  {
+    return false;
+  }
   float signalSum = 0.0f;
   float weightedPositionMm = 0.0f;
+  bool partialLineSeen = false;
 
   for (uint32_t index = 0; index < LINE_SENSOR_COUNT; ++index)
   {
-    float signal = (float)((int32_t)values[index] - adcWhite[index]) /
+    int32_t contrast = (int32_t)values[index] - adcWhite[index];
+    float signal = (float)contrast /
                    (float)(adcBlack[index] - adcWhite[index]);
     if (signal < 0.0f)
     {
@@ -32,11 +63,16 @@ bool LineError_Calculate(const uint16_t values[LINE_SENSOR_COUNT],
     {
       signal = 1.0f;
     }
+    if (signal >= MIN_PARTIAL_LINE_SIGNAL &&
+        contrast >= MIN_PARTIAL_LINE_ADC)
+    {
+      partialLineSeen = true;
+    }
     signalSum += signal;
     weightedPositionMm += sensorPositionMm[index] * signal;
   }
 
-  if (signalSum < MIN_LINE_SIGNAL)
+  if (signalSum < MIN_LINE_SIGNAL && !partialLineSeen)
   {
     return false;
   }
