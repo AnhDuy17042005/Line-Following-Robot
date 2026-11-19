@@ -19,12 +19,24 @@
 #define LOAD_BRAKE_LEAD_MM 0.0f
 #define LOAD_SLOWDOWN_MM 200.0f
 #define LOAD_APPROACH_SPEED_MPS 0.10f
+
+#define FORK_PATTERN_TICKS 3U
+#define FORK_SPEED_MPS 0.25f
+#define FORK_MAX_YAW_RAD_S 0.30f
+#define FORK_ACQUIRED_TICKS 5U
+#define FORK_TIMEOUT_MS 12000U
+
+#define END_MIN_AFTER_FORK_MM 1800.0f
+#define END_LINE_LOST_TICKS 8U
+
 #define LINE_LOST_CONFIRM_TICKS 3U
 #define LOAD_MIN_SETTLE_MS 150U
 #define LOAD_STABLE_TICKS 10U
 #define ENCODER_STALL_MS 500U
+
 #define COLOR_SAMPLE_INTERVAL_MS 120U
 #define COLOR_CONFIRM_SAMPLES 10U
+
 #define STATUS_HEARTBEAT_MS 1000U
 
 extern TIM_HandleTypeDef htim2;
@@ -62,6 +74,10 @@ typedef struct
   uint32_t lastEncoderMotionMs;
   float lastDistanceMm;
   float loadStopDistanceMm;
+  float forkDetectedDistanceMm;
+  uint8_t forkPatternTicks;
+  uint8_t forkAcquiredTicks;
+  bool forkSideSeen;
   bool distanceStarted;
   bool fault;
 } RobotProcess;
@@ -124,7 +140,7 @@ static void Robot_Fault(const char *message)
 static void Robot_LogHeartbeat(void)
 {
   if (!process.fault && process.phase != STOP_LOAD &&
-      process.phase != READ_COLOR)
+      process.phase != READ_COLOR && process.phase != STOP_END)
   {
     return;
   }
@@ -261,6 +277,10 @@ static void Robot_ReadColorTask(void)
     SpeedPi_Reset();
     process.lastDistanceMm = Motor_GetDistanceMm();
     process.lastEncoderMotionMs = HAL_GetTick();
+    process.forkPatternTicks = 0U;
+    process.forkAcquiredTicks = 0U;
+    process.forkSideSeen = false;
+    lineLostTicks = 0U;
     Robot_EnterPhase(RUN_TO_FORK);
     processedTicks = controlTicks;
     lastControlMs = HAL_GetTick();
@@ -390,9 +410,10 @@ void Robot_Task(void)
     return;
   }
   if (process.phase != RUN_TO_LOAD && process.phase != STOP_LOAD &&
-      process.phase != RUN_TO_FORK)
+      process.phase != RUN_TO_FORK && process.phase != FORK &&
+      process.phase != RUN_TO_END)
   {
-    return; /* Fork/end actions are reserved for later stages. */
+    return;
   }
 
   uint32_t currentTicks = controlTicks;
@@ -460,19 +481,95 @@ void Robot_Task(void)
     return;
   }
 
-  if (!LineError_Calculate(lineValues, &errorMeters))
+  if (process.phase == RUN_TO_FORK)
   {
-    if (process.distanceStarted &&
-        lineLostTicks < LINE_LOST_CONFIRM_TICKS)
+    if (LineError_ForkPattern(lineValues))
+    {
+      if (process.forkPatternTicks < FORK_PATTERN_TICKS)
+      {
+        ++process.forkPatternTicks;
+      }
+    }
+    else
+    {
+      process.forkPatternTicks = 0U;
+    }
+    if (process.forkPatternTicks >= FORK_PATTERN_TICKS)
+    {
+      if (process.cargoColor != COLOR_SENSOR_RED &&
+          process.cargoColor != COLOR_SENSOR_BLUE)
+      {
+        Robot_Fault("FORK COLOR MISSING; MOTORS STOPPED\r\n");
+        return;
+      }
+      process.forkAcquiredTicks = 0U;
+      process.forkSideSeen = false;
+      process.forkDetectedDistanceMm = distanceMm;
+      lineLostTicks = 0U;
+      LinePd_Reset();
+      Robot_EnterPhase(FORK);
+      char message[128];
+      (void)snprintf(message, sizeof(message),
+                     "FORK SELECT %s D=%d mm A=%u,%u,%u,%u,%u\r\n",
+                     process.cargoColor == COLOR_SENSOR_RED ? "RED LEFT" :
+                     "BLUE RIGHT", (int)distanceMm,
+                     (unsigned)lineValues[0], (unsigned)lineValues[1],
+                     (unsigned)lineValues[2], (unsigned)lineValues[3],
+                     (unsigned)lineValues[4]);
+      Robot_Print(message);
+    }
+  }
+
+  bool selectedSideSeen = false;
+  bool branchAcquired = false;
+  bool lineValid = process.phase == FORK ?
+                   LineError_CalculateFork(lineValues,
+                                           process.cargoColor == COLOR_SENSOR_RED,
+                                           &errorMeters, &selectedSideSeen,
+                                           &branchAcquired) :
+                   LineError_Calculate(lineValues, &errorMeters);
+  if (!lineValid)
+  {
+    bool endAreaEligible = process.phase == RUN_TO_END &&
+                           distanceMm - process.forkDetectedDistanceMm >=
+                           END_MIN_AFTER_FORK_MM;
+    uint8_t lostLimit = endAreaEligible ? END_LINE_LOST_TICKS :
+                        LINE_LOST_CONFIRM_TICKS;
+    if (lineLostTicks < lostLimit)
     {
       ++lineLostTicks;
-      /* Keep the previous PWM for a brief dropout, then stop if it persists. */
+    }
+    if (process.distanceStarted && lineLostTicks < lostLimit)
+    {
+      /* Keep the previous PWM briefly across a gap in the painted line. */
       LinePd_Reset();
       return;
     }
     Motor_Stop();
     LinePd_Reset();
     SpeedPi_Reset();
+    if (process.phase == FORK)
+    {
+      char message[112];
+      (void)snprintf(message, sizeof(message),
+                     "FORK LINE LOST D=%d A=%u,%u,%u,%u,%u; STOPPED\r\n",
+                     (int)distanceMm, (unsigned)lineValues[0],
+                     (unsigned)lineValues[1], (unsigned)lineValues[2],
+                     (unsigned)lineValues[3], (unsigned)lineValues[4]);
+      Robot_Fault(message);
+      return;
+    }
+    if (endAreaEligible)
+    {
+      robotStatus = ROBOT_STATUS_STOPPED;
+      Robot_EnterPhase(STOP_END);
+      char message[64];
+      (void)snprintf(message, sizeof(message),
+                     "END LINE EXIT D=%d mm; MOTORS STOPPED\r\n",
+                     (int)distanceMm);
+      Robot_Print(message);
+      return;
+    }
     process.lastEncoderMotionMs = HAL_GetTick();
     robotStatus = ROBOT_STATUS_NO_LINE;
     Robot_LogStatus("NO LINE", lineValues, 0.0f, 0.0f, 0.0f,
@@ -480,6 +577,49 @@ void Robot_Task(void)
     return;
   }
   lineLostTicks = 0U;
+
+  if (process.phase == FORK)
+  {
+    if (HAL_GetTick() - process.phaseStartedMs >= FORK_TIMEOUT_MS)
+    {
+      Robot_Fault("FORK TIMEOUT; BRANCH NOT ACQUIRED; MOTORS STOPPED\r\n");
+      return;
+    }
+    if (selectedSideSeen)
+    {
+      process.forkSideSeen = true;
+    }
+    if (process.forkSideSeen && branchAcquired)
+    {
+      if (process.forkAcquiredTicks < FORK_ACQUIRED_TICKS)
+      {
+        ++process.forkAcquiredTicks;
+      }
+    }
+    else
+    {
+      process.forkAcquiredTicks = 0U;
+    }
+    if (process.forkAcquiredTicks >= FORK_ACQUIRED_TICKS)
+    {
+      uint32_t forkDurationMs = HAL_GetTick() - process.phaseStartedMs;
+      LinePd_Reset();
+      Robot_EnterPhase(RUN_TO_END);
+      char message[128];
+      (void)snprintf(message, sizeof(message),
+                     "FORK BRANCH ACQUIRED T=%lu ms D=%d mm A=%u,%u,%u,%u,%u; TO_END\r\n",
+                     (unsigned long)forkDurationMs, (int)distanceMm,
+                     (unsigned)lineValues[0], (unsigned)lineValues[1],
+                     (unsigned)lineValues[2], (unsigned)lineValues[3],
+                     (unsigned)lineValues[4]);
+      Robot_Print(message);
+      if (!LineError_Calculate(lineValues, &errorMeters))
+      {
+        Robot_Fault("FORK EXIT LINE LOST; MOTORS STOPPED\r\n");
+        return;
+      }
+    }
+  }
 
   if (!process.distanceStarted)
   {
@@ -521,10 +661,27 @@ void Robot_Task(void)
   }
 
   float yawRate = LinePd_Update(errorMeters, periodSeconds);
-  float baseSpeed = process.phase == RUN_TO_LOAD &&
-                    distanceMm >= process.loadStopDistanceMm -
-                    LOAD_SLOWDOWN_MM ? LOAD_APPROACH_SPEED_MPS :
-                    BASE_SPEED_MPS;
+  if (process.phase == FORK)
+  {
+    if (yawRate > FORK_MAX_YAW_RAD_S)
+    {
+      yawRate = FORK_MAX_YAW_RAD_S;
+    }
+    else if (yawRate < -FORK_MAX_YAW_RAD_S)
+    {
+      yawRate = -FORK_MAX_YAW_RAD_S;
+    }
+  }
+  float baseSpeed = BASE_SPEED_MPS;
+  if (process.phase == RUN_TO_LOAD &&
+      distanceMm >= process.loadStopDistanceMm - LOAD_SLOWDOWN_MM)
+  {
+    baseSpeed = LOAD_APPROACH_SPEED_MPS;
+  }
+  else if (process.phase == FORK)
+  {
+    baseSpeed = FORK_SPEED_MPS;
+  }
   float leftSpeed = baseSpeed - 0.5f * WHEEL_SPACING_M * yawRate;
   float rightSpeed = baseSpeed + 0.5f * WHEEL_SPACING_M * yawRate;
   if (leftSpeed < 0.0f)
@@ -552,7 +709,12 @@ void Robot_Task(void)
                  &leftDutyPercent, &rightDutyPercent);
   Motor_SetDuty(leftDutyPercent, rightDutyPercent);
   robotStatus = ROBOT_STATUS_RUNNING;
-  Robot_LogStatus(process.phase == RUN_TO_FORK ? "TO_FORK" : "TO_LOAD",
+  const char *state = process.phase == RUN_TO_FORK ? "TO_FORK" :
+                      process.phase == FORK ?
+                      (process.cargoColor == COLOR_SENSOR_RED ?
+                       "FORK_RED" : "FORK_BLUE") :
+                      process.phase == RUN_TO_END ? "TO_END" : "TO_LOAD";
+  Robot_LogStatus(state,
                   lineValues, errorMeters, leftSetRpm,
                   rightSetRpm, leftMeasuredRpm,
                   rightMeasuredRpm);

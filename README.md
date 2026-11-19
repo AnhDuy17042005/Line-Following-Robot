@@ -57,6 +57,32 @@ Trên xe này, T1 ở bên phải và T5 ở bên trái theo hướng tiến; đ
 trục bánh. Khi T1 đọc vạch, bánh trái phải chạy nhanh hơn bánh phải để xe
 rẽ sang phải. Khi T5 đọc vạch, xe rẽ sang trái.
 
+### Rẽ nhánh theo màu hàng
+
+Sau `CARGO RED` hoặc `CARGO BLUE`, robot vào `RUN_TO_FORK` và tiếp tục dò line.
+Khi T1/T2 và T4/T5 cùng thấy line đen, còn T3 thấy nền trắng trong 3 chu kỳ
+điều khiển liên tiếp, robot nhận diện điểm tách nhánh và vào `FORK`. Không có
+mốc encoder hoặc thời gian dự đoán vị trí nhánh.
+
+`CARGO RED` chỉ dùng T4–T5 để lái theo nhánh trái; `CARGO BLUE` chỉ dùng T1–T2
+để lái theo nhánh phải. Trong `FORK`, xe chạy ở `0.15 m/s` và giới hạn góc lái.
+Khi cả hai mắt ở phía không chọn thấy nền trắng, trong khi phía đã chọn hoặc
+T3 vẫn thấy line đen, robot xác nhận nhánh. Sau 5 chu kỳ liên tiếp, robot vào
+`RUN_TO_END` và dò line bằng cả 5 mắt; không phải chờ line quay về T3.
+Nếu mất line phía
+đã chọn 3 chu kỳ hoặc không bắt được nhánh trong 12 giây, motor dừng và UART
+báo lỗi. UART in `FORK SELECT`, `FORK BRANCH ACQUIRED` (kèm thời gian ở nhánh
+và 5 giá trị ADC) và trạng thái
+`FORK_RED`/`FORK_BLUE` để đối chiếu. Các ngưỡng đen/trắng chuẩn hóa trong
+`Core/Robot/line_error.c` cần kiểm tra trên sa bàn thật.
+
+Trong `RUN_TO_END`, encoder chỉ dùng để chặn nhận nhầm điểm kết thúc trong
+1800 mm đầu tiên sau **điểm nhánh đã phát hiện bằng cảm biến**. Sau đó, nếu
+đầu dò mất line liên tiếp 8 chu kỳ, robot chuyển `STOP_END` và dừng ngay tại
+mép line. Encoder không quyết định thời điểm bắt đầu hoặc hoàn tất rẽ nhánh.
+Chưa có đoạn đi thêm vào sâu khu vực kết thúc; cần đo khoảng cách đó trên
+xe thật trước khi thiết lập.
+
 Build và nạp firmware test sensor:
 
 ```bash
